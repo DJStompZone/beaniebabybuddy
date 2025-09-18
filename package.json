@@ -7,7 +7,7 @@
 		"dev": "wrangler dev",
 		"start": "wrangler dev",
 		"build": "wrangler build",
-		"push": "git add . ; git commit ; git push"
+		"push": "git add . ; git commit && npm version patch && git push"
 	},
 	"devDependencies": {
 		"wrangler": "^3.101.0"
