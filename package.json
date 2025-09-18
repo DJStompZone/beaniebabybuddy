@@ -6,7 +6,8 @@
 		"deploy": "wrangler deploy",
 		"dev": "wrangler dev",
 		"start": "wrangler dev",
-                "build": "wrangler build"
+                "build": "wrangler build",
+                "push": "git add . ; git commit ; git push"
 	},
 	"devDependencies": {
 		"wrangler": "^3.101.0"
