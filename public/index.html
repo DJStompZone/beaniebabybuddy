@@ -1,0 +1,519 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BeanieBabyBuddy</title>
+  <meta name="color-scheme" content="dark light" />
+  <!-- WebRTC adapter improves cross-browser gUM quirks (per Quagga docs) -->
+  <script src="https://webrtc.github.io/adapter/adapter-latest.js"></script>
+
+  <style>
+    :root { --bg:#0b0f14; --fg:#e8eef7; --muted:#7f8ea3; --accent:#2dd4bf; --danger:#ef4444; --card:#121821; --ok:#10b981; }
+    html,body { height:100%; margin:0 }
+    body { font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial; background:#0b0f14; color:var(--fg); padding:1rem }
+    .app { max-width:960px; margin:0 auto; display:grid; gap:1rem }
+    .grid { display:grid; grid-template-columns:1fr 1fr; gap:1rem }
+    @media (max-width:768px){ .grid{ grid-template-columns:1fr } }
+    .card { background:var(--card); border:1px solid #1f2937; border-radius:16px; padding:1rem }
+    h1 { margin:0 0 .5rem 0 }
+    .row { display:flex; gap:.5rem; align-items:center; flex-wrap:wrap }
+    input, button, select { border-radius:12px; padding:.6rem 1rem; font-size:1rem }
+    input { background:#0e1420; color:var(--fg); border:1px solid #2b364b; flex:1 }
+    button { border:0; background:var(--accent); color:#052f2a; font-weight:700; cursor:pointer }
+    button.secondary { background:#1f2937; color:var(--fg); border:1px solid #2b364b }
+    .muted { color:var(--muted) }
+    .error { color:var(--danger) }
+    .ok { color:var(--ok) }
+
+    /* Video container; Quagga will inject <video> inside this */
+    .video-wrap { position:relative; border-radius:12px; overflow:hidden; background:#000; min-height:200px }
+    .video-wrap.ok-flash { box-shadow:0 0 0 3px var(--ok) inset }
+    .video-wrap video { display:block; width:100%; height:auto; max-height:75vh; object-fit:contain; transform-origin:center center }
+    .video-wrap.rot90 video { transform: rotate(90deg); }
+    .scan-band { position:absolute; left:10%; right:10%; top:30%; bottom:30%; border:2px dashed rgba(255,255,255,0.25); border-radius:12px; pointer-events:none }
+
+    table { width:100%; border-collapse:collapse }
+    th,td { border-bottom:1px solid #1f2937; padding:.4rem; text-align:left }
+    .price { font-variant-numeric:tabular-nums }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="card">
+      <h1>Beanie Scanner</h1>
+      <p class="muted">Scan a barcode, then look up resale values from Etsy and optional eBay.</p>
+      <div class="row">
+        <button id="startBtn">Start Camera</button>
+        <button id="stopBtn" class="secondary">Stop</button>
+        <span id="camState" class="muted">idle</span>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Live Scanner</h2>
+        <div id="videoWrap" class="video-wrap">
+          <!-- Quagga will inject <video> here -->
+          <div class="scan-band" aria-hidden="true"></div>
+        </div>
+        <div class="row" style="margin-top:.5rem">
+          <button id="torchBtn" class="secondary">Torch</button>
+          <button id="zoomInBtn" class="secondary">Zoom +</button>
+          <button id="zoomOutBtn" class="secondary">Zoom −</button>
+          <button id="rotateBtn" class="secondary">Rotate 90°</button>
+        </div>
+        <div class="row" style="margin-top:.5rem">
+          <select id="cameraSelect"></select>
+          <button id="switchBtn" class="secondary">Switch Camera</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Lookup</h2>
+        <div class="row">
+          <input id="manual" type="text" placeholder="Enter UPC/EAN or keywords" />
+          <button id="lookupBtn">Lookup</button>
+        </div>
+        <p id="detected" class="muted">Waiting for a scan</p>
+        <p id="error" class="error" style="display:none"></p>
+        <div class="row">
+          <span class="muted">Matches: <strong id="count">—</strong></span>
+          <span class="muted">Median: <strong id="median">—</strong></span>
+          <span class="muted">P25–P75: <strong id="iqr">—</strong></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Results</h2>
+      <table>
+        <thead><tr><th>Title</th><th>Price</th><th>Cond.</th><th>Buy</th><th>Src</th></tr></thead>
+        <tbody id="results"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Load Quagga UMD from a CDN; known-good and simple global (per docs) -->
+  <script src="https://cdn.jsdelivr.net/npm/@ericblade/quagga2@1.8.4/dist/quagga.min.js"></script>
+
+  <script type="module">
+    /**
+     * Returns Quagga instance if available, regardless of UMD flavor.
+     * We call this right before using Quagga so we don't capture an undefined reference.
+     */
+    function resolveQuagga() {
+      const wq = /** @type {any} */ (window).Quagga;
+      if (wq && typeof wq.init === "function") return wq;
+      if (wq && wq.default && typeof wq.default.init === "function") return wq.default;
+      return null;
+    }
+
+    /**
+     * Wait until Quagga is present (handles slow CDN / deferred execution).
+     * @param {number} timeoutMs
+     */
+    async function waitForQuagga(timeoutMs = 8000) {
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        const q = resolveQuagga();
+        if (q) return q;
+        await new Promise(r => setTimeout(r, 50));
+      }
+      throw new Error("Quagga failed to load in time");
+    }
+
+    /** @typedef {{title:string, price:number, condition?:string, url?:string, source?:string}} PriceRow */
+
+    /** Logger ***************************************************************/
+    class Logger {
+      /** @param {"log"|"warn"|"error"} level @param {string} msg @param {any=} meta */
+      static write(level, msg, meta) {
+        try { console[level](msg, meta || null); } catch (_) {}
+        try {
+          fetch("/log", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ ts: Date.now(), level, msg: "[client] " + msg, meta: meta || null })
+          });
+        } catch (_) {}
+      }
+      static info(msg, meta) { Logger.write("log", msg, meta); }
+      static warn(msg, meta) { Logger.write("warn", msg, meta); }
+      static error(msg, meta) { Logger.write("error", msg, meta); }
+    }
+
+    /** Quagga Wrapper *******************************************************/
+    class QuaggaWrapper {
+      /**
+       * @param {HTMLElement} videoWrap
+       */
+      constructor(videoWrap) {
+        this.videoWrap = videoWrap;
+        this.active = false;
+        this.eventsAttached = false;
+        this._onDetected = null;
+        this._onProcessed = null;
+        this.currentTrack = null;
+        this.currentDeviceId = null;
+        this.torchOn = false;
+        this.zoom = 1;
+        this.onHit = null;
+        this._lastCode = "";
+        this._lastAt = 0;
+      }
+
+      /**
+       * Initialize and start Quagga with the given device. Quagga opens the stream.
+       * @param {string|null} deviceId
+       * @returns {Promise<void>}
+       */
+      async init(deviceId) {
+        const Q = await waitForQuagga();
+        this.currentDeviceId = deviceId || null;
+
+        /** @type {any} */
+        const config = {
+          inputStream: {
+            name: "Live",
+            type: "LiveStream",
+            target: this.videoWrap, // <== container div (per docs)
+            constraints: {
+              deviceId: this.currentDeviceId ? { exact: this.currentDeviceId } : undefined,
+              facingMode: this.currentDeviceId ? undefined : "environment",
+              width: { ideal: 1280 },
+              height: { ideal: 720 }
+              // focus/zoom/torch applied after start via track.applyConstraints
+            },
+            area: { top: "30%", right: "10%", left: "10%", bottom: "30%" }
+          },
+          locator: { patchSize: "large", halfSample: false },
+          numOfWorkers: 0,            // iOS-friendly
+          frequency: 15,
+          decoder: { readers: ["ean_reader", "ean_8_reader", "upc_reader", "upc_e_reader", "code_128_reader"] },
+          locate: true
+        };
+
+        Logger.info("Quagga.init begin", { deviceId: this.currentDeviceId });
+
+        await new Promise((resolve, reject) => {
+          let timedOut = false;
+          const timer = setTimeout(() => {
+            timedOut = true;
+            try { Q.stop(); } catch (_) {}
+            this.active = false;
+            Logger.warn("Quagga init timeout", null);
+            reject(new Error("Quagga init timeout"));
+          }, 12000);
+
+          Q.init(config, async (err) => {
+            if (timedOut) return;
+            clearTimeout(timer);
+
+            if (err) {
+              Logger.error("Quagga init failed", String(err));
+              reject(err);
+              return;
+            }
+
+            try { Q.start(); } catch (e) {
+              Logger.error("Quagga start failed", String(e));
+              reject(e);
+              return;
+            }
+            this.active = true;
+
+            try {
+              const track = Q.CameraAccess && Q.CameraAccess.getActiveTrack ? Q.CameraAccess.getActiveTrack() : null;
+              if (track) {
+                this.currentTrack = track;
+                this.zoom = 2;
+                await this.applyTrackConstraints();
+              }
+            } catch (e) {
+              Logger.warn("No track capabilities", String(e));
+            }
+
+            if (!this.eventsAttached) {
+              this._onProcessed = (res) => {
+                const boxes = res && res.boxes ? res.boxes.length : 0;
+                if (boxes) {Logger.info("processed", { boxes })};
+              };
+              Q.onProcessed(this._onProcessed);
+
+              this._onDetected = (data) => {
+                const code = data && data.codeResult && data.codeResult.code ? data.codeResult.code : null;
+                if (!code) return;
+                const now = Date.now();
+                if (code === this._lastCode && now - this._lastAt < 1200) return;
+                this._lastCode = code;
+                this._lastAt = now;
+                Logger.info("barcode detected", { code });
+                this.flash();
+                try { if (navigator.vibrate) navigator.vibrate(150); } catch (_) {}
+                if (this.onHit) this.onHit(code);
+              };
+              Q.onDetected(this._onDetected);
+
+              this.eventsAttached = true;
+            }
+
+            Logger.info("Quagga started", { deviceId: this.currentDeviceId });
+            resolve();
+          });
+        });
+      }
+
+      stop() {
+        const Q = resolveQuagga();
+        try { Q && Q.stop(); } catch (_) {}
+        try {
+          const t = Q && Q.CameraAccess && Q.CameraAccess.getActiveTrack ? Q.CameraAccess.getActiveTrack() : null;
+          if (t && t.stop) t.stop();
+        } catch (_) {}
+        if (this.eventsAttached) {
+          try { if (Q && typeof Q.offProcessed === "function" && this._onProcessed) Q.offProcessed(this._onProcessed); } catch (_) {}
+          try { if (Q && typeof Q.offDetected === "function" && this._onDetected) Q.offDetected(this._onDetected); } catch (_) {}
+          this.eventsAttached = false;
+        }
+        this.active = false;
+        this.currentTrack = null;
+        Logger.info("Quagga stopped", null);
+      }
+
+      async applyTrackConstraints() {
+        if (!this.currentTrack) return;
+        const caps = this.currentTrack.getCapabilities ? this.currentTrack.getCapabilities() : {};
+        const cons = { advanced: [] };
+        if (caps.torch) cons.advanced.push({ torch: this.torchOn });
+        // caps.zoom can be a number or object with min/max
+        if (typeof caps.zoom === "number" || (caps.zoom && typeof caps.zoom.max === "number")) cons.advanced.push({ zoom: this.zoom });
+        try {
+          await this.currentTrack.applyConstraints(cons);
+          Logger.info("applied constraints", cons);
+        } catch (e) {
+          Logger.warn("applyConstraints failed", String(e));
+        }
+      }
+
+      flash() {
+        this.videoWrap.classList.add("ok-flash");
+        setTimeout(() => { this.videoWrap.classList.remove("ok-flash"); }, 220);
+      }
+
+      async toggleTorch() { this.torchOn = !this.torchOn; await this.applyTrackConstraints(); }
+      async zoomIn() { this.zoom = (this.zoom || 1) + 0.5; await this.applyTrackConstraints(); }
+      async zoomOut() { this.zoom = Math.max(1, (this.zoom || 1) - 0.5); await this.applyTrackConstraints(); }
+    }
+
+    /** Camera Controller *****************************************************/
+    class CameraController {
+      /**
+       * @param {HTMLElement} videoWrap
+       * @param {HTMLSelectElement} selectEl
+       */
+      constructor(videoWrap, selectEl) {
+        this.videoWrap = videoWrap;
+        this.selectEl = selectEl;
+        this.wrapper = new QuaggaWrapper(videoWrap);
+        this.devices = [];
+        this.currentId = null;
+        this.onStatus = null;
+      }
+
+      async populateDevices() {
+        const devs = await navigator.mediaDevices.enumerateDevices();
+        this.devices = devs.filter(d => d.kind === "videoinput");
+        this.selectEl.innerHTML = "";
+        this.devices.forEach((d, i) => {
+          const opt = document.createElement("option");
+          opt.value = d.deviceId;
+          opt.textContent = d.label || "Camera " + String(i + 1);
+          this.selectEl.appendChild(opt);
+        });
+        const env = this.devices.find(c => /back|rear|environment/i.test(c.label)) || this.devices[0] || null;
+        this.currentId = env ? env.deviceId : null;
+        if (this.currentId) this.selectEl.value = this.currentId;
+      }
+
+      async start() {
+        if (this.onStatus) this.onStatus("starting");
+
+        // Preflight permission so enumerateDevices has labels (helps iOS/Safari)
+        try {
+          const tmp = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
+          tmp.getTracks().forEach(t => t.stop());
+        } catch (e) {
+          Logger.warn("preflight getUserMedia failed (will try anyway)", String(e));
+        }
+
+        const perm = await this.permissionState();
+        Logger.info("permission state", { camera: perm });
+        if (perm === "denied") {
+          if (this.onStatus) this.onStatus("blocked");
+          throw new Error("Camera permission blocked");
+        }
+
+        await this.populateDevices();
+        await this.wrapper.init(this.currentId);
+        if (this.onStatus) this.onStatus("running");
+      }
+
+      stop() {
+        this.wrapper.stop();
+        if (this.onStatus) this.onStatus("stopped");
+      }
+
+      async switchCamera() {
+        if (!this.devices.length) await this.populateDevices();
+        const idx = this.devices.findIndex(d => d.deviceId === this.currentId);
+        const next = this.devices[(idx + 1) % this.devices.length];
+        this.currentId = next.deviceId;
+        this.selectEl.value = this.currentId;
+        this.stop();
+        await this.start();
+      }
+
+      async permissionState() {
+        try {
+          if (!navigator.permissions || !navigator.permissions.query) return "unknown";
+          const res = await navigator.permissions.query({ name: "camera" });
+          return res.state || "unknown";
+        } catch (_) { return "unknown"; }
+      }
+    }
+
+    /** Pricing ***************************************************************/
+    class PriceEstimator {
+      static async estimate(q) {
+        const res = await fetch("/api/estimate?query=" + encodeURIComponent(q));
+        if (!res.ok) throw new Error(await res.text() || String(res.status));
+        return res.json();
+      }
+    }
+
+    /** Utilities *************************************************************/
+    function usd(n) {
+      if (n == null || !isFinite(n)) return "—";
+      return new Intl.NumberFormat(undefined, { style: "currency", currency: "USD" }).format(n);
+    }
+    function stats(vals) {
+      const a = vals.slice().sort((x, y) => x - y);
+      function q(p) { const i = (a.length - 1) * p; const lo = Math.floor(i); const hi = Math.ceil(i); return (a[lo] + a[hi]) / 2; }
+      return { median: q(0.5), p25: q(0.25), p75: q(0.75) };
+    }
+
+    /** App *******************************************************************/
+    class App {
+      constructor() {
+        this.els = {
+          start: document.getElementById("startBtn"),
+          stop: document.getElementById("stopBtn"),
+          switchBtn: document.getElementById("switchBtn"),
+          torchBtn: document.getElementById("torchBtn"),
+          zoomInBtn: document.getElementById("zoomInBtn"),
+          zoomOutBtn: document.getElementById("zoomOutBtn"),
+          rotateBtn: document.getElementById("rotateBtn"),
+          select: document.getElementById("cameraSelect"),
+          videoWrap: document.getElementById("videoWrap"),
+          state: document.getElementById("camState"),
+          detected: document.getElementById("detected"),
+          error: document.getElementById("error"),
+          count: document.getElementById("count"),
+          median: document.getElementById("median"),
+          iqr: document.getElementById("iqr"),
+          manual: document.getElementById("manual"),
+          lookupBtn: document.getElementById("lookupBtn"),
+          results: document.getElementById("results")
+        };
+
+        this.camera = new CameraController(this.els.videoWrap, this.els.select);
+        this.camera.wrapper.onHit = (code) => this.onHit(code);
+        this.camera.onStatus = (s) => { this.els.state.textContent = s; };
+
+        this.bindUI();
+      }
+
+      bindUI() {
+        this.els.start.onclick = () => { this.start(); };
+        this.els.stop.onclick = () => { this.stop(); };
+        this.els.switchBtn.onclick = () => { this.switchCamera(); };
+        this.els.lookupBtn.onclick = () => {
+          const v = this.els.manual.value.trim();
+          if (v) this.lookup(v);
+        };
+        this.els.manual.onkeydown = (e) => { if (e.key === "Enter") this.els.lookupBtn.click(); };
+
+        this.els.torchBtn.onclick = () => { this.camera.wrapper.toggleTorch(); };
+        this.els.zoomInBtn.onclick = () => { this.camera.wrapper.zoomIn(); };
+        this.els.zoomOutBtn.onclick = () => { this.camera.wrapper.zoomOut(); };
+        this.els.rotateBtn.onclick = () => { this.els.videoWrap.classList.toggle("rot90"); };
+
+        document.addEventListener("visibilitychange", () => { if (document.hidden) this.stop(); });
+      }
+
+      async start() {
+        this.clearError();
+        try { await this.camera.start(); }
+        catch (e) { this.showError("Camera failed to start: " + String(e && e.message ? e.message : e)); }
+      }
+
+      stop() { this.camera.stop(); }
+
+      async switchCamera() {
+        this.clearError();
+        try { await this.camera.switchCamera(); }
+        catch (e) { this.showError("Switch camera failed: " + String(e && e.message ? e.message : e)); }
+      }
+
+      async onHit(code) {
+        this.els.detected.textContent = "Detected: " + code;
+        try { await this.lookup(code); }
+        catch (e) { this.showError("Lookup failed: " + String(e && e.message ? e.message : e)); }
+      }
+
+      async lookup(q) {
+        this.clearError();
+        this.els.detected.textContent = "Looking up: " + q;
+        const data = await PriceEstimator.estimate(q);
+        const prices = data.items.map(i => i.price).filter(isFinite);
+        if (!prices.length) {
+          this.els.count.textContent = "0";
+          this.els.median.textContent = "—";
+          this.els.iqr.textContent = "—";
+          this.renderRows([]);
+          this.els.detected.textContent = data.note || "No results";
+          return;
+        }
+        const s = stats(prices);
+        this.els.count.textContent = String(prices.length);
+        this.els.median.textContent = usd(s.median);
+        this.els.iqr.textContent = usd(s.p25) + "–" + usd(s.p75);
+        this.renderRows(data.items);
+        this.els.detected.textContent = data.note || "Matched " + String(prices.length) + " items";
+      }
+
+      renderRows(items) {
+        this.els.results.innerHTML = "";
+        for (let i = 0; i < items.length; i += 1) {
+          const it = items[i];
+          const tr = document.createElement("tr");
+          tr.innerHTML =
+            "<td>" + it.title + "</td>" +
+            "<td class='price'>" + usd(it.price) + "</td>" +
+            "<td>" + (it.condition || "") + "</td>" +
+            "<td>" + (it.url ? "<a href='" + it.url + "' target='_blank' rel='noreferrer'>Open</a>" : "") + "</td>" +
+            "<td>" + (it.source || "") + "</td>";
+          this.els.results.appendChild(tr);
+        }
+      }
+
+      showError(msg) { this.els.error.textContent = msg; this.els.error.style.display = "block"; }
+      clearError() { this.els.error.textContent = ""; this.els.error.style.display = "none"; }
+    }
+
+    // Kick it
+    const app = new App();
+  </script>
+</body>
+</html>
