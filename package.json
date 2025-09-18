@@ -1,13 +1,13 @@
 {
 	"name": "beaniebabybuddy",
-	"version": "1.0.1",
+	"version": "1.0.2",
 	"private": false,
 	"scripts": {
 		"deploy": "wrangler deploy",
 		"dev": "wrangler dev",
 		"start": "wrangler dev",
-                "build": "wrangler build",
-                "push": "git add . ; git commit ; git push"
+		"build": "wrangler build",
+		"push": "git add . ; git commit ; git push"
 	},
 	"devDependencies": {
 		"wrangler": "^3.101.0"
