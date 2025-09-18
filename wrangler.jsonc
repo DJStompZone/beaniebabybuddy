@@ -6,6 +6,7 @@
     "enabled": true
   },
   "workers_dev": true,
+  "preview_urls": true,
   "assets": {
     "directory": "public",
     "binding": "ASSETS"
