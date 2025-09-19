@@ -26,52 +26,46 @@ async function waitForQuagga(timeoutMs = 8000) {
 }
 
 /** @typedef {{title:string, price:number, condition?:string, url?:string, source?:string}} PriceRow */
-
 /**
- * Logger with level threshold, sampling, batching, and debug toggle.
- * - Network logging only if debug mode is enabled.
- * - Batches messages into a single POST every LOG_BATCH_MS.
- * - Soft cap per minute to prevent storms.
+ * Quiet-by-default logger:
+ * - console always logs locally
+ * - network logging is OFF by default
+ * - when debug is enabled, only ERRORs get shipped (change LEVEL if you want warn+error)
+ * - dedupes identical messages within a window and batches them
  */
 class Logger {
-  /** Config */
   static LOG_LEVELS = { log: 10, warn: 20, error: 30 };
-  static LEVEL = Logger.LOG_LEVELS.warn;                     // minimum level to record
-  static DEBUG = false;                                     // network logging on/off
-  static LOG_SAMPLE = 1.0;                                  // 0..1 sampling
-  static LOG_BATCH_MS = 1500;                               // batch window
-  static LOG_MAX_PER_MIN = 60;                              // per minute soft cap
+  static LEVEL = Logger.LOG_LEVELS.error;  // ship only errors by default (set to 'warn' if you want warn+error)
+  static DEBUG = false;                     // network off by default
+  static LOG_SAMPLE = 1.0;                  // keep all matched-by-level (you can drop to 0.25 etc)
+  static LOG_BATCH_MS = 3000;               // flush window
+  static LOG_MAX_PER_MIN = 20;              // hard cap per minute
+  static DEDUPE_MS = 5000;                  // merge identical messages for 5s
 
   static _q = [];
   static _timer = null;
   static _minuteStart = Date.now();
   static _sentThisMinute = 0;
+  static _recent = new Map();               // key -> {ts,count}
 
-  /**
-   * Enable or disable network logging at runtime.
-   * Sources: URL ?debug=1, localStorage('bbb.debug') === '1', or call Logger.setDebug(true)
-   */
   static initDebugFlag() {
     try {
       const url = new URL(location.href);
       if (url.searchParams.get("debug") === "1") localStorage.setItem("bbb.debug", "1");
       if (url.searchParams.get("debug") === "0") localStorage.removeItem("bbb.debug");
       Logger.DEBUG = localStorage.getItem("bbb.debug") === "1";
-    } catch (_) {}
+      // optional: when debug=1, allow warnings too
+      if (Logger.DEBUG && url.searchParams.get("level") === "warn") Logger.LEVEL = Logger.LOG_LEVELS.warn;
+    } catch {}
   }
 
-  /** Public API */
-  static info(msg, meta)  { Logger.write("log", msg, meta); }
-  static warn(msg, meta)  { Logger.write("warn", msg, meta); }
-  static error(msg, meta) { Logger.write("error", msg, meta); }
+  static info(msg, meta)  { Logger._write("log", msg, meta); }
+  static warn(msg, meta)  { Logger._write("warn", msg, meta); }
+  static error(msg, meta) { Logger._write("error", msg, meta); }
 
-  /**
-   * Core write: respects level, sampling, batching.
-   * Always logs to devtools console; only POSTs if DEBUG is true.
-   */
-  static write(level, msg, meta) {
-    // devtools
-    try { (console[level] || console.log)(msg, meta || null); } catch {}
+  static _write(level, msg, meta) {
+    // always show locally
+    try { (console[level] || console.log)(msg, meta ?? null); } catch {}
 
     // network disabled
     if (!Logger.DEBUG) return;
@@ -82,12 +76,22 @@ class Logger {
     // sampling
     if (Logger.LOG_SAMPLE < 1 && Math.random() > Logger.LOG_SAMPLE) return;
 
-    // per-minute soft cap
+    // per-minute cap
     const now = Date.now();
     if (now - Logger._minuteStart >= 60_000) { Logger._minuteStart = now; Logger._sentThisMinute = 0; }
+
+    // dedupe: collapse identical messages within DEDUPE_MS
+    const key = level + "|" + String(msg || "") + "|" + (meta ? JSON.stringify(meta).slice(0, 200) : "");
+    const recent = Logger._recent.get(key);
+    if (recent && now - recent.ts < Logger.DEDUPE_MS) {
+      recent.count += 1; recent.ts = now; Logger._recent.set(key, recent);
+      return;
+    }
+    Logger._recent.set(key, { ts: now, count: 1 });
+
     if (Logger._sentThisMinute >= Logger.LOG_MAX_PER_MIN) return;
 
-    Logger._q.push({ ts: now, level, msg: String(msg || ""), meta: meta ?? null, ua: navigator.userAgent });
+    Logger._q.push({ ts: now, level, msg: String(msg || ""), meta: meta ?? null });
     Logger._scheduleFlush();
   }
 
@@ -100,29 +104,36 @@ class Logger {
     Logger._timer = null;
     if (!Logger._q.length) return;
 
-    // take snapshot
-    const batch = Logger._q.splice(0, Logger._q.length);
+    // merge duplicates accumulated in _recent during the window
+    const batch = [];
+    while (Logger._q.length) {
+      const it = Logger._q.shift();
+      const key = it.level + "|" + it.msg + "|" + (it.meta ? JSON.stringify(it.meta).slice(0, 200) : "");
+      const rec = Logger._recent.get(key);
+      const count = rec ? rec.count : 1;
+      batch.push(count > 1 ? { ...it, count } : it);
+    }
+
+    const toSend = Math.min(batch.length, Logger.LOG_MAX_PER_MIN - Logger._sentThisMinute);
+    if (toSend <= 0) return;
+
     try {
       await fetch("/log", {
         method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ batch })
+        headers: { "content-type": "application/json", "x-bbb-debug": "1" }, // server requires this
+        body: JSON.stringify({ batch: batch.slice(0, toSend) })
       });
-      Logger._sentThisMinute += batch.length;
-    } catch
-    {
-      // ignore
-    }
+      Logger._sentThisMinute += toSend;
+    } catch {}
   }
 
+  // handy runtime knobs
   static setDebug(on) { Logger.DEBUG = !!on; if (on) localStorage.setItem("bbb.debug", "1"); else localStorage.removeItem("bbb.debug"); }
   static setLevel(name) { if (name in Logger.LOG_LEVELS) Logger.LEVEL = Logger.LOG_LEVELS[name]; }
   static setSample(p) { Logger.LOG_SAMPLE = Math.max(0, Math.min(1, Number(p))); }
 }
-
-// enable from URL/localStorage once at startup
+// enable URL flag toggles (?debug=1 or ?debug=0; ?level=warn)
 Logger.initDebugFlag();
-
 
 /* ---------- GTIN validation / normalization --------------------------- */
 
