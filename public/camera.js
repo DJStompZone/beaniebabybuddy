@@ -27,36 +27,102 @@ async function waitForQuagga(timeoutMs = 8000) {
 
 /** @typedef {{title:string, price:number, condition?:string, url?:string, source?:string}} PriceRow */
 
-/** Logger ***************************************************************/
+/**
+ * Logger with level threshold, sampling, batching, and debug toggle.
+ * - Network logging only if debug mode is enabled.
+ * - Batches messages into a single POST every LOG_BATCH_MS.
+ * - Soft cap per minute to prevent storms.
+ */
 class Logger {
-  /** @param {"log"|"warn"|"error"} level @param {string} msg @param {any=} meta */
-  static write(level, msg, meta) {
+  /** Config */
+  static LOG_LEVELS = { log: 10, warn: 20, error: 30 };
+  static LEVEL = Logger.LOG_LEVELS.warn;                     // minimum level to record
+  static DEBUG = false;                                     // network logging on/off
+  static LOG_SAMPLE = 1.0;                                  // 0..1 sampling
+  static LOG_BATCH_MS = 1500;                               // batch window
+  static LOG_MAX_PER_MIN = 60;                              // per minute soft cap
+
+  static _q = [];
+  static _timer = null;
+  static _minuteStart = Date.now();
+  static _sentThisMinute = 0;
+
+  /**
+   * Enable or disable network logging at runtime.
+   * Sources: URL ?debug=1, localStorage('bbb.debug') === '1', or call Logger.setDebug(true)
+   */
+  static initDebugFlag() {
     try {
-      console[level](msg, meta || null);
+      const url = new URL(location.href);
+      if (url.searchParams.get("debug") === "1") localStorage.setItem("bbb.debug", "1");
+      if (url.searchParams.get("debug") === "0") localStorage.removeItem("bbb.debug");
+      Logger.DEBUG = localStorage.getItem("bbb.debug") === "1";
     } catch (_) {}
+  }
+
+  /** Public API */
+  static info(msg, meta)  { Logger.write("log", msg, meta); }
+  static warn(msg, meta)  { Logger.write("warn", msg, meta); }
+  static error(msg, meta) { Logger.write("error", msg, meta); }
+
+  /**
+   * Core write: respects level, sampling, batching.
+   * Always logs to devtools console; only POSTs if DEBUG is true.
+   */
+  static write(level, msg, meta) {
+    // devtools
+    try { (console[level] || console.log)(msg, meta || null); } catch {}
+
+    // network disabled
+    if (!Logger.DEBUG) return;
+
+    // level threshold
+    if ((Logger.LOG_LEVELS[level] || 999) < Logger.LEVEL) return;
+
+    // sampling
+    if (Logger.LOG_SAMPLE < 1 && Math.random() > Logger.LOG_SAMPLE) return;
+
+    // per-minute soft cap
+    const now = Date.now();
+    if (now - Logger._minuteStart >= 60_000) { Logger._minuteStart = now; Logger._sentThisMinute = 0; }
+    if (Logger._sentThisMinute >= Logger.LOG_MAX_PER_MIN) return;
+
+    Logger._q.push({ ts: now, level, msg: String(msg || ""), meta: meta ?? null, ua: navigator.userAgent });
+    Logger._scheduleFlush();
+  }
+
+  static _scheduleFlush() {
+    if (Logger._timer) return;
+    Logger._timer = setTimeout(Logger._flush, Logger.LOG_BATCH_MS);
+  }
+
+  static async _flush() {
+    Logger._timer = null;
+    if (!Logger._q.length) return;
+
+    // take snapshot
+    const batch = Logger._q.splice(0, Logger._q.length);
     try {
-      fetch("/log", {
+      await fetch("/log", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          ts: Date.now(),
-          level,
-          msg: "[client] " + msg,
-          meta: meta || null,
-        }),
+        body: JSON.stringify({ batch })
       });
-    } catch (_) {}
+      Logger._sentThisMinute += batch.length;
+    } catch
+    {
+      // ignore
+    }
   }
-  static info(msg, meta) {
-    Logger.write("log", msg, meta);
-  }
-  static warn(msg, meta) {
-    Logger.write("warn", msg, meta);
-  }
-  static error(msg, meta) {
-    Logger.write("error", msg, meta);
-  }
+
+  static setDebug(on) { Logger.DEBUG = !!on; if (on) localStorage.setItem("bbb.debug", "1"); else localStorage.removeItem("bbb.debug"); }
+  static setLevel(name) { if (name in Logger.LOG_LEVELS) Logger.LEVEL = Logger.LOG_LEVELS[name]; }
+  static setSample(p) { Logger.LOG_SAMPLE = Math.max(0, Math.min(1, Number(p))); }
 }
+
+// enable from URL/localStorage once at startup
+Logger.initDebugFlag();
+
 
 /* ---------- GTIN validation / normalization --------------------------- */
 
