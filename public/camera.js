@@ -590,16 +590,62 @@ class App {
       setStatus("📈", "calculating");
       const { itemsForTable, stats, note } = unpackEstimateResponse(data);
 
-      // Stats display
-      this.els.count.textContent = String(
-        stats.count || itemsForTable.length || 0
-      );
-      this.els.median.textContent = usd(stats.median);
-      this.els.iqr.textContent = usd(stats.p25) + "–" + usd(stats.p75);
+      let rows = Array.isArray(itemsForTable) ? itemsForTable : [];
 
-      // Table
-      this.renderRows(itemsForTable);
-      this.els.detected.textContent = note || "Done";
+      // Local fallback: if API gave nothing and q looks like a UPC/EAN with valid checksum
+      if (rows.length === 0 && isValidGTIN(q)) {
+        try {
+          const localRows = await localLookupByUPC(q);
+          if (localRows.length) {
+            rows = localRows;
+
+            // recompute minimal stats for local rows
+            const vals = rows
+              .map((r) => r.price)
+              .filter(Number.isFinite)
+              .sort((a, b) => a - b);
+            const qf = (p) => {
+              const i = (vals.length - 1) * p;
+              const lo = Math.floor(i);
+              const hi = Math.ceil(i);
+              return (vals[lo] + vals[hi]) / 2;
+            };
+            const localStats = {
+              count: vals.length,
+              median: qf(0.5),
+              p25: qf(0.25),
+              p75: qf(0.75),
+            };
+
+            this.els.count.textContent = String(localStats.count);
+            this.els.median.textContent = usd(localStats.median);
+            this.els.iqr.textContent =
+              usd(localStats.p25) + "–" + usd(localStats.p75);
+            this.els.detected.textContent =
+              (note ? note + " | " : "") + "Local UPC match";
+          }
+        } catch (e) {
+          // don't fail the run if local file is missing; just log
+          Logger.warn(
+            "local beanies.json lookup failed",
+            String(e && e.message ? e.message : e)
+          );
+        }
+      }
+
+      // If we didn’t use local, display API stats as before
+      if (
+        rows.length &&
+        this.els.detected.textContent.indexOf("Local UPC match") === -1
+      ) {
+        this.els.count.textContent = String(stats.count || rows.length || 0);
+        this.els.median.textContent = usd(stats.median);
+        this.els.iqr.textContent = usd(stats.p25) + "–" + usd(stats.p75);
+        this.els.detected.textContent = note || "Done";
+      }
+
+      // Render whatever we ended up with
+      this.renderRows(rows);
       setStatus("🏁", "done");
     } catch (e) {
       setStatus("❌", "error");
@@ -661,7 +707,9 @@ async function initCameraUI() {
   try {
     await app.camera.populateDevices();
   } catch (e) {
-    app.showError("Failed to enumerate cameras: " + String(e && e.message ? e.message : e));
+    app.showError(
+      "Failed to enumerate cameras: " + String(e && e.message ? e.message : e)
+    );
   }
 }
 
@@ -675,6 +723,62 @@ function initLookupUI() {
       else document.getElementById("lookupBtn")?.click(); // fallback
     }
   } catch (_) {}
+}
+/** ---------- Local beanies.json fallback ---------- */
+let __BEANIES_INDEX = null;
+
+/**
+ * Load and index /beanies.json by UPC, de-duping by sku.
+ * Returns a Map<upc, Array<{title,price,condition?,url?,source}>> ready for the table.
+ */
+async function loadBeaniesIndex() {
+  if (__BEANIES_INDEX) return __BEANIES_INDEX;
+  const res = await fetch("/beanies.json", { cache: "reload" });
+  if (!res.ok) throw new Error("Failed to load beanies.json: " + res.status);
+  const raw = await res.json();
+
+  const byUpc = new Map();
+  for (let i = 0; i < raw.length; i++) {
+    const r = raw[i] || {};
+    const upc = String(r.upc || "").replace(/\D/g, "");
+    if (!upc) continue;
+
+    const arr = byUpc.get(upc) || [];
+    if (arr.some((x) => x.__sku === r.sku)) continue;
+
+    const priceNum = Number(String(r.we_pay || "").replace(/[^0-9.]/g, ""));
+    if (!Number.isFinite(priceNum)) continue;
+
+    arr.push({
+      title: r.name || r.sku || "Beanie (local)",
+      price: priceNum,
+      condition: undefined,
+      url: r.url || r.icollect_url || undefined,
+      source: "local",
+      __sku: r.sku || undefined,
+    });
+    byUpc.set(upc, arr);
+  }
+  __BEANIES_INDEX = byUpc;
+  return byUpc;
+}
+
+/**
+ * Lookup local rows by UPC (returns [] if none). Requires clean, checksum-valid GTIN.
+ * @param {string} upc
+ */
+async function localLookupByUPC(upc) {
+  const s = String(upc || "").replace(/\D/g, "");
+  if (!s || !isValidGTIN(s)) return [];
+  const idx = await loadBeaniesIndex();
+  const rows = idx.get(s) || [];
+  return rows.map((r) => ({
+    title: r.title,
+    price: r.price,
+    condition: r.condition,
+    url: r.url,
+    source: r.source,
+  }));
 }
 
 document.addEventListener("DOMContentLoaded", () => {
