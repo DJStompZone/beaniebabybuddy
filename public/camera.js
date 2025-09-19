@@ -1,189 +1,152 @@
-// camera.js
-// Camera utilities for BeanieBabyBuddy with detailed client logs and visual indicator for barcode detections
+let app;
 
-const Quagga = window.Quagga;
+/**
+ * Returns Quagga instance if available, regardless of UMD flavor.
+ */
+function resolveQuagga() {
+  const wq = /** @type {any} */ (window).Quagga;
+  if (wq && typeof wq.init === "function") return wq;
+  if (wq && wq.default && typeof wq.default.init === "function")
+    return wq.default;
+  return null;
+}
 
-export function initCamera(els, estimate) {
-  let stream = null;
-  let currentTrack = null;
-  let currentDeviceId = null;
-  let torchOn = false;
-  let currentZoom = 1;
-  let onDetectedBound = null;
-  let lastCode = "";
-  let lastHitMs = 0;
+/**
+ * Wait until Quagga is present (handles slow CDN / deferred execution).
+ * @param {number} timeoutMs
+ */
+async function waitForQuagga(timeoutMs = 8000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const q = resolveQuagga();
+    if (q) return q;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  throw new Error("Quagga failed to load in time");
+}
 
-  function log(level, msg, meta) {
-    try { console[level](msg, meta || null); } catch (_) {}
+/** @typedef {{title:string, price:number, condition?:string, url?:string, source?:string}} PriceRow */
+
+/** Logger ***************************************************************/
+class Logger {
+  /** @param {"log"|"warn"|"error"} level @param {string} msg @param {any=} meta */
+  static write(level, msg, meta) {
+    try {
+      console[level](msg, meta || null);
+    } catch (_) {}
     try {
       fetch("/log", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ level: level, msg: msg, meta: meta || null })
+        body: JSON.stringify({
+          ts: Date.now(),
+          level,
+          msg: "[client] " + msg,
+          meta: meta || null,
+        }),
       });
     } catch (_) {}
   }
+  static info(msg, meta) {
+    Logger.write("log", msg, meta);
+  }
+  static warn(msg, meta) {
+    Logger.write("warn", msg, meta);
+  }
+  static error(msg, meta) {
+    Logger.write("error", msg, meta);
+  }
+}
 
-  function uiStatus(text) { els.camState.textContent = text; }
-  function uiError(text) { els.error.textContent = text; els.error.style.display = "block"; }
-  function uiClearError() { els.error.textContent = ""; els.error.style.display = "none"; }
+/* ---------- GTIN validation / normalization --------------------------- */
 
-  async function permissionState() {
-    try {
-      if (!navigator.permissions || !navigator.permissions.query) return "unknown";
-      const res = await navigator.permissions.query({ name: "camera" });
-      return res.state || "unknown";
-    } catch (_) {
-      return "unknown";
-    }
+/**
+ * Validate GTIN-8/12/13/14 using the standard mod-10 checksum.
+ */
+function isValidGTIN(code) {
+  const s = String(code || "").replace(/\D/g, "");
+  const L = s.length;
+  if (L !== 8 && L !== 12 && L !== 13 && L !== 14) return false;
+  const digits = s.split("").map(Number);
+  const check = digits.pop();
+  let sum = 0,
+    mul = 3;
+  for (let i = digits.length - 1; i >= 0; i--) {
+    sum += digits[i] * mul;
+    mul = mul === 3 ? 1 : 3;
+  }
+  const cd = (10 - (sum % 10)) % 10;
+  return cd === check;
+}
+
+/**
+ * Accept a scanned barcode only if it passes checksum.
+ * Prefer UPC-A/EAN-13; allow EAN-8 but de-prioritize.
+ * Returns the normalized numeric string or null.
+ */
+function acceptScannedCode(raw) {
+  const s = String(raw || "").replace(/\D/g, "");
+  if (!isValidGTIN(s)) return null;
+  if (s.length >= 12) return s; // UPC-A / EAN-13 / GTIN-14
+  return s.length === 8 ? s : null; // EAN-8 (okay, but not preferred)
+}
+
+/**
+ * Normalize manually entered UPC/EAN (strip, pad common cases).
+ * For UPC-A vs EAN-13 with leading 0, keep the 12-digit UPC when possible.
+ */
+function normalizeInputCode(raw) {
+  const s = String(raw || "").replace(/\D/g, "");
+  if (s.length === 13 && s.startsWith("0")) return s.slice(1);
+  return s;
+}
+
+/** Quagga Wrapper *******************************************************/
+class QuaggaWrapper {
+  /**
+   * @param {HTMLElement} videoWrap
+   */
+  constructor(videoWrap) {
+    this.videoWrap = videoWrap;
+    this.active = false;
+    this.eventsAttached = false;
+    this._onDetected = null;
+    this._onProcessed = null;
+    this.currentTrack = null;
+    this.currentDeviceId = null;
+    this.torchOn = false;
+    this.zoom = 1;
+    this.onHit = null;
+    this._lastCode = "";
+    this._lastAt = 0;
   }
 
-  async function listCameras() {
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    const cams = devices.filter(function (d) { return d.kind === "videoinput"; });
-    log("log", "enumerated cameras", { count: cams.length, labels: cams.map(function (c) { return c.label; }) });
-    return cams;
-  }
+  /**
+   * Initialize and start Quagga with the given device. Quagga opens the stream.
+   * @param {string|null} deviceId
+   * @returns {Promise<void>}
+   */
+  async init(deviceId) {
+    const Q = await waitForQuagga();
+    this.currentDeviceId = deviceId || null;
 
-  async function openStreamForDevice(deviceId) {
-    const constraints = deviceId
-      ? { video: { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } } }
-      : { video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } } };
-
-    uiStatus("requesting");
-    log("log", "getUserMedia request", { constraints: constraints });
-
-    const s = await navigator.mediaDevices.getUserMedia(constraints);
-    stream = s;
-
-    const video = els.preview;
-    video.srcObject = stream;
-    await video.play();
-
-    const track = stream.getVideoTracks()[0];
-    currentTrack = track;
-
-    const settings = track.getSettings ? track.getSettings() : {};
-    currentDeviceId = settings.deviceId || deviceId || null;
-
-    log("log", "getUserMedia granted", { deviceId: currentDeviceId, settings: settings });
-    return currentDeviceId;
-  }
-
-  function closeStream() {
-    try {
-      if (stream) {
-        stream.getTracks().forEach(function (t) { try { t.stop(); } catch (_) {} });
-      }
-    } catch (_) {}
-    stream = null;
-    currentTrack = null;
-  }
-
-  async function applyTrackControls() {
-    if (!currentTrack) return;
-    const caps = currentTrack.getCapabilities ? currentTrack.getCapabilities() : {};
-    const cons = { advanced: [] };
-
-    if (caps.torch) cons.advanced.push({ torch: torchOn });
-
-    if (typeof caps.zoom === "number" || (caps.zoom && typeof caps.zoom.max === "number")) {
-      cons.advanced.push({ zoom: currentZoom });
-    }
-
-    try {
-      await currentTrack.applyConstraints(cons);
-      log("log", "applied constraints", { constraints: cons });
-    } catch (e) {
-      log("warn", "applyConstraints failed", { error: String(e) });
-    }
-  }
-
-  function flashDetected() {
-    const frame = els.preview.parentElement;
-    const prev = frame.style.boxShadow;
-    frame.style.boxShadow = "0 0 0 3px #10b981 inset";
-    setTimeout(function () { frame.style.boxShadow = prev; }, 220);
-  }
-
-  function attachDetectionHandler() {
-    if (onDetectedBound) Quagga.offDetected(onDetectedBound);
-    onDetectedBound = function onDetected(data) {
-      const code = data && data.codeResult && data.codeResult.code;
-      if (!code) return;
-
-      const now = Date.now();
-      if (code === lastCode && now - lastHitMs < 1200) return; // debounce duplicate hits
-      lastCode = code;
-      lastHitMs = now;
-
-      log("log", "barcode detected", { code: code });
-      flashDetected();
-      try { if (navigator.vibrate) navigator.vibrate(35); } catch (_) {}
-
-      Quagga.pause();
-      els.detected.textContent = "Detected: " + code;
-
-      const query = /^\d{8,14}$/.test(code) ? code : code;
-      Promise.resolve(estimate(query)).finally(function () { Quagga.start(); });
-    };
-    Quagga.onDetected(onDetectedBound);
-  }
-
-  async function start() {
-    uiClearError();
-    const pstate = await permissionState();
-    log("log", "permission state", { camera: pstate });
-
-    if (pstate === "denied") {
-      uiStatus("blocked");
-      uiError("Camera permission is blocked. Allow camera in site settings, then tap Start again.");
-      return false;
-    }
-
-    uiStatus("starting");
-
-    const cams = await listCameras();
-    els.cameraSelect.innerHTML = "";
-    cams.forEach(function (d, i) {
-      const opt = document.createElement("option");
-      opt.value = d.deviceId;
-      opt.textContent = d.label || "Camera " + String(i + 1);
-      els.cameraSelect.appendChild(opt);
-    });
-
-    const env = cams.find(function (c) { return /back|rear|environment/i.test(c.label); }) || cams[0];
-    const desiredId = env ? env.deviceId : null;
-    els.cameraSelect.value = desiredId || (cams[0] && cams[0].deviceId) || "";
-
-    try {
-      await openStreamForDevice(desiredId);
-    } catch (e) {
-      uiStatus("error");
-      uiError("getUserMedia failed: " + String(e && e.message ? e.message : e));
-      log("error", "getUserMedia failed", { error: String(e) });
-      return false;
-    }
-
-    try {
-      currentZoom = 2;
-      await applyTrackControls();
-    } catch (_) {}
-
+    /** @type {any} */
     const config = {
       inputStream: {
-  name: "Live",
-  type: "LiveStream",
-  target: els.preview.parentElement,
-  constraints: {
-      deviceId: currentDeviceId ? { exact: currentDeviceId } : undefined,
-      width: { ideal: 720 },
-      height: { ideal: 1280 }
-  },
-  area: {
-      top: "30%", right: "10%", left: "10%", bottom: "30%" }
-  },
-      locator: { patchSize: "large", halfSample: true },
+        name: "Live",
+        type: "LiveStream",
+        target: this.videoWrap,
+        constraints: {
+          deviceId: this.currentDeviceId
+            ? { exact: this.currentDeviceId }
+            : undefined,
+          facingMode: this.currentDeviceId ? undefined : "environment",
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
+        area: { top: "30%", right: "10%", left: "10%", bottom: "30%" },
+      },
+      locator: { patchSize: "large", halfSample: false },
       numOfWorkers: 0,
       frequency: 15,
       decoder: {
@@ -192,76 +155,530 @@ export function initCamera(els, estimate) {
           "ean_8_reader",
           "upc_reader",
           "upc_e_reader",
-          "code_128_reader"
-        ]
+          "code_128_reader",
+        ],
       },
-      locate: true
+      locate: true,
     };
 
-    let initDone = false;
-    const timeoutMs = 14000;
-    const timer = setTimeout(function () {
-      if (initDone) return;
-      uiStatus("timeout");
-      uiError("Camera init timed out. If no permission prompt appeared, allow camera for this site and try Start again.");
-      log("warn", "Quagga init timeout", null);
-      try { Quagga.stop(); } catch (_) {}
-    }, timeoutMs);
+    Logger.info("Quagga.init begin", { deviceId: this.currentDeviceId });
 
-    return new Promise(function (resolve) {
-      log("log", "Quagga.init begin", { deviceId: currentDeviceId });
-      Quagga.init(config, async function (err) {
-        initDone = true;
+    await new Promise((resolve, reject) => {
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        try {
+          Q.stop();
+        } catch (_) {}
+        this.active = false;
+        Logger.warn("Quagga init timeout", null);
+        reject(new Error("Quagga init timeout"));
+      }, 12000);
+
+      Q.init(config, async (err) => {
+        if (timedOut) return;
         clearTimeout(timer);
 
         if (err) {
-          uiStatus("error");
-          uiError("Quagga init failed: " + String(err));
-          log("error", "Quagga init failed", { error: String(err) });
-          resolve(false);
+          Logger.error("Quagga init failed", String(err));
+          reject(err);
           return;
         }
 
-        Quagga.start();
-        uiStatus("running");
-        log("log", "Quagga started", { deviceId: currentDeviceId });
+        try {
+          Q.start();
+        } catch (e) {
+          Logger.error("Quagga start failed", String(e));
+          reject(e);
+          return;
+        }
+        this.active = true;
 
         try {
-          const qTrack = Quagga.CameraAccess.getActiveTrack();
-          if (qTrack) currentTrack = qTrack;
-          await applyTrackControls();
+          const track =
+            Q.CameraAccess && Q.CameraAccess.getActiveTrack
+              ? Q.CameraAccess.getActiveTrack()
+              : null;
+          if (track) {
+            this.currentTrack = track;
+            this.zoom = 2;
+
+            const s = (track.getSettings && track.getSettings()) || {};
+            if (s.width && s.height) {
+              this.videoWrap.style.setProperty(
+                "--aspect",
+                `${s.width} / ${s.height}`
+              );
+              this.videoWrap.style.setProperty(
+                "--aspect-inv",
+                `${s.height} / ${s.width}`
+              );
+            }
+
+            await this.applyTrackConstraints();
+          }
         } catch (e) {
-          log("warn", "track capabilities not available", { error: String(e) });
+          Logger.warn("No track capabilities", String(e));
         }
 
-        attachDetectionHandler();
-        resolve(true);
+        if (!this.eventsAttached) {
+          this._onProcessed = (res) => {
+            const boxes = res && res.boxes ? res.boxes.length : 0;
+            if (boxes) {
+              Logger.info("processed", { boxes });
+            }
+          };
+          Q.onProcessed(this._onProcessed);
+
+          this._onDetected = (data) => {
+            const raw =
+              data && data.codeResult && data.codeResult.code
+                ? data.codeResult.code
+                : "";
+            const code = acceptScannedCode(raw);
+            if (!code) return; // bad checksum / junk
+
+            const now = Date.now();
+            if (code === this._lastCode && now - this._lastAt < 1200) return;
+            this._lastCode = code;
+            this._lastAt = now;
+            Logger.info("barcode detected", { code });
+            this.flash();
+            try {
+              if (navigator.vibrate) navigator.vibrate(150);
+            } catch (_) {}
+            if (this.onHit) this.onHit(code);
+          };
+          Q.onDetected(this._onDetected);
+
+          this.eventsAttached = true;
+        }
+
+        Logger.info("Quagga started", { deviceId: this.currentDeviceId });
+        resolve();
       });
     });
   }
 
-  function stop() {
-    try { Quagga.stop(); } catch (_) {}
-    closeStream();
-    uiStatus("stopped");
-    log("log", "stopped", null);
+  stop() {
+    const Q = resolveQuagga();
+    try {
+      Q && Q.stop();
+    } catch (_) {}
+    try {
+      const t =
+        Q && Q.CameraAccess && Q.CameraAccess.getActiveTrack
+          ? Q.CameraAccess.getActiveTrack()
+          : null;
+      if (t && t.stop) t.stop();
+    } catch (_) {}
+    if (this.eventsAttached) {
+      try {
+        if (Q && typeof Q.offProcessed === "function" && this._onProcessed)
+          Q.offProcessed(this._onProcessed);
+      } catch (_) {}
+      try {
+        if (Q && typeof Q.offDetected === "function" && this._onDetected)
+          Q.offDetected(this._onDetected);
+      } catch (_) {}
+      this.eventsAttached = false;
+    }
+    this.active = false;
+    this.currentTrack = null;
+    Logger.info("Quagga stopped", null);
   }
 
-  async function switchCamera() {
-    const cams = await listCameras();
-    if (!cams.length) return;
-    const idx = cams.findIndex(function (c) { return c.deviceId === currentDeviceId; });
-    const next = cams[(idx + 1) % cams.length];
-    els.cameraSelect.value = next.deviceId;
-    stop();
-    await start();
+  async applyTrackConstraints() {
+    if (!this.currentTrack) return;
+    const caps = this.currentTrack.getCapabilities
+      ? this.currentTrack.getCapabilities()
+      : {};
+    const cons = { advanced: [] };
+    if (caps.torch) cons.advanced.push({ torch: this.torchOn });
+    if (
+      typeof caps.zoom === "number" ||
+      (caps.zoom && typeof caps.zoom.max === "number")
+    )
+      cons.advanced.push({ zoom: this.zoom });
+    try {
+      await this.currentTrack.applyConstraints(cons);
+      Logger.info("applied constraints", cons);
+    } catch (e) {
+      Logger.warn("applyConstraints failed", String(e));
+    }
   }
 
-  async function toggleTorch() { torchOn = !torchOn; await applyTrackControls(); }
-  async function zoomIn() { currentZoom = (currentZoom || 1) + 0.5; await applyTrackControls(); }
-  async function zoomOut() { currentZoom = (currentZoom || 1) - 0.5; if (currentZoom < 1) currentZoom = 1; await applyTrackControls(); }
+  flash() {
+    this.videoWrap.classList.add("ok-flash");
+    setTimeout(() => {
+      this.videoWrap.classList.remove("ok-flash");
+    }, 220);
+  }
 
-  document.addEventListener("visibilitychange", function () { if (document.hidden) stop(); });
-
-  return { start, stop, switchCamera, toggleTorch, zoomIn, zoomOut };
+  async toggleTorch() {
+    this.torchOn = !this.torchOn;
+    await this.applyTrackConstraints();
+  }
+  async zoomIn() {
+    this.zoom = (this.zoom || 1) + 0.5;
+    await this.applyTrackConstraints();
+  }
+  async zoomOut() {
+    this.zoom = Math.max(1, (this.zoom || 1) - 0.5);
+    await this.applyTrackConstraints();
+  }
 }
+
+/** Camera Controller *****************************************************/
+class CameraController {
+  /**
+   * @param {HTMLElement} videoWrap
+   * @param {HTMLSelectElement} selectEl
+   */
+  constructor(videoWrap, selectEl) {
+    this.videoWrap = videoWrap;
+    this.selectEl = selectEl;
+    this.wrapper = new QuaggaWrapper(videoWrap);
+    this.devices = [];
+    this.currentId = null;
+    this.onStatus = null;
+  }
+
+  async populateDevices() {
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    this.devices = devs.filter((d) => d.kind === "videoinput");
+    this.selectEl.innerHTML = "";
+    this.devices.forEach((d, i) => {
+      const opt = document.createElement("option");
+      opt.value = d.deviceId;
+      opt.textContent = d.label || "Camera " + String(i + 1);
+      this.selectEl.appendChild(opt);
+    });
+    const env =
+      this.devices.find((c) => /back|rear|environment/i.test(c.label)) ||
+      this.devices[0] ||
+      null;
+    this.currentId = env ? env.deviceId : null;
+    if (this.currentId) this.selectEl.value = this.currentId;
+  }
+
+  async start() {
+    if (this.onStatus) this.onStatus("starting");
+
+    // Preflight permission so enumerateDevices has labels (helps iOS/Safari)
+    try {
+      const tmp = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment" },
+        audio: false,
+      });
+      tmp.getTracks().forEach((t) => t.stop());
+    } catch (e) {
+      Logger.warn("preflight getUserMedia failed (will try anyway)", String(e));
+    }
+
+    const perm = await this.permissionState();
+    Logger.info("permission state", { camera: perm });
+    if (perm === "denied") {
+      if (this.onStatus) this.onStatus("blocked");
+      throw new Error("Camera permission blocked");
+    }
+
+    await this.populateDevices();
+    await this.wrapper.init(this.currentId);
+    if (this.onStatus) this.onStatus("running");
+  }
+
+  stop() {
+    this.wrapper.stop();
+    if (this.onStatus) this.onStatus("stopped");
+  }
+
+  async switchCamera() {
+    if (!this.devices.length) await this.populateDevices();
+    const idx = this.devices.findIndex((d) => d.deviceId === this.currentId);
+    const next = this.devices[(idx + 1) % this.devices.length];
+    this.currentId = next.deviceId;
+    this.selectEl.value = this.currentId;
+    this.stop();
+    await this.start();
+  }
+
+  async permissionState() {
+    try {
+      if (!navigator.permissions || !navigator.permissions.query)
+        return "unknown";
+      const res = await navigator.permissions.query({ name: "camera" });
+      return res.state || "unknown";
+    } catch (_) {
+      return "unknown";
+    }
+  }
+}
+
+/** Pricing ***************************************************************/
+class PriceEstimator {
+  static async estimate(q) {
+    const res = await fetch("/api/estimate?query=" + encodeURIComponent(q));
+    if (!res.ok) throw new Error((await res.text()) || String(res.status));
+    return res.json();
+  }
+}
+
+/** Utilities *************************************************************/
+function usd(n) {
+  if (n == null || !isFinite(n)) return "—";
+  return new Intl.NumberFormat(undefined, {
+    style: "currency",
+    currency: "USD",
+  }).format(n);
+}
+function stats(vals) {
+  const a = vals.slice().sort((x, y) => x - y);
+  function q(p) {
+    const i = (a.length - 1) * p;
+    const lo = Math.floor(i);
+    const hi = Math.ceil(i);
+    return (a[lo] + a[hi]) / 2;
+  }
+  return { median: q(0.5), p25: q(0.25), p75: q(0.75) };
+}
+
+/**
+ * Pick items and stats from either the legacy shape ({items})
+ * or the new unified shape ({items_current, items_sold, stats}).
+ * Prefers SOLD items for display; falls back to CURRENT.
+ */
+function unpackEstimateResponse(data) {
+  if (Array.isArray(data.items)) {
+    const vals = data.items.map((i) => i.price).filter(Number.isFinite);
+    return {
+      itemsForTable: data.items,
+      stats: { count: vals.length, ...stats(vals) },
+      note: data.note || "",
+    };
+  }
+  const sold = Array.isArray(data.items_sold) ? data.items_sold : [];
+  const current = Array.isArray(data.items_current) ? data.items_current : [];
+  const combined = sold.concat(current);
+  const vals = combined.map((i) => i.price).filter(Number.isFinite);
+  const combinedStats =
+    data.stats && data.stats.combined
+      ? data.stats.combined
+      : { count: vals.length, ...stats(vals) };
+  const itemsForTable = sold.length ? sold : current;
+  return { itemsForTable, stats: combinedStats, note: data.note || "" };
+}
+
+function setStatus(icon, text) {
+  const el = document.getElementById("statusPill");
+  if (el) el.textContent = icon + " " + text;
+}
+
+/** App *******************************************************************/
+class App {
+  constructor() {
+    this.els = {
+      start: document.getElementById("startBtn"),
+      stop: document.getElementById("stopBtn"),
+      switchBtn: document.getElementById("switchBtn"),
+      torchBtn: document.getElementById("torchBtn"),
+      zoomInBtn: document.getElementById("zoomInBtn"),
+      zoomOutBtn: document.getElementById("zoomOutBtn"),
+      rotateBtn: document.getElementById("rotateBtn"),
+      select: document.getElementById("cameraSelect"),
+      videoWrap: document.getElementById("videoWrap"),
+      state: document.getElementById("camState"),
+      detected: document.getElementById("detected"),
+      error: document.getElementById("error"),
+      count: document.getElementById("count"),
+      median: document.getElementById("median"),
+      iqr: document.getElementById("iqr"),
+      manual: document.getElementById("manual"),
+      lookupBtn: document.getElementById("lookupBtn"),
+      results: document.getElementById("results"),
+    };
+
+    this.camera = new CameraController(this.els.videoWrap, this.els.select);
+    this.camera.wrapper.onHit = (code) => this.onHit(code);
+    this.camera.onStatus = (s) => {
+      this.els.state.textContent = s;
+    };
+
+    this.bindUI();
+  }
+
+  bindUI() {
+    this.els.start.onclick = () => {
+      this.start();
+    };
+    this.els.stop.onclick = () => {
+      this.stop();
+    };
+    this.els.switchBtn.onclick = () => {
+      this.switchCamera();
+    };
+    this.els.lookupBtn.onclick = () => {
+      const v = normalizeInputCode(this.els.manual.value.trim());
+      if (v) this.lookupWithStatus(v);
+    };
+    this.els.manual.onkeydown = (e) => {
+      if (e.key === "Enter") this.els.lookupBtn.click();
+    };
+
+    this.els.torchBtn.onclick = () => {
+      this.camera.wrapper.toggleTorch();
+    };
+    this.els.zoomInBtn.onclick = () => {
+      this.camera.wrapper.zoomIn();
+    };
+    this.els.zoomOutBtn.onclick = () => {
+      this.camera.wrapper.zoomOut();
+    };
+    this.els.rotateBtn.onclick = () => {
+      this.els.videoWrap.classList.toggle("rot90");
+    };
+
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) this.stop();
+    });
+  }
+
+  async start() {
+    this.clearError();
+    try {
+      await this.camera.start();
+    } catch (e) {
+      this.showError(
+        "Camera failed to start: " + String(e && e.message ? e.message : e)
+      );
+    }
+  }
+
+  stop() {
+    this.camera.stop();
+  }
+
+  async switchCamera() {
+    this.clearError();
+    try {
+      await this.camera.switchCamera();
+    } catch (e) {
+      this.showError(
+        "Switch camera failed: " + String(e && e.message ? e.message : e)
+      );
+    }
+  }
+
+  async onHit(code) {
+    this.els.detected.textContent = "Detected: " + code;
+    try {
+      await this.lookupWithStatus(code);
+    } catch (e) {
+      this.showError(
+        "Lookup failed: " + String(e && e.message ? e.message : e)
+      );
+    }
+  }
+
+  async lookupWithStatus(q) {
+    this.clearError();
+    setStatus("⏳", "queued");
+    await Promise.resolve();
+    try {
+      setStatus("🔎", "fetching");
+      const data = await PriceEstimator.estimate(q);
+      setStatus("📈", "calculating");
+      const { itemsForTable, stats, note } = unpackEstimateResponse(data);
+
+      // Stats display
+      this.els.count.textContent = String(
+        stats.count || itemsForTable.length || 0
+      );
+      this.els.median.textContent = usd(stats.median);
+      this.els.iqr.textContent = usd(stats.p25) + "–" + usd(stats.p75);
+
+      // Table
+      this.renderRows(itemsForTable);
+      this.els.detected.textContent = note || "Done";
+      setStatus("🏁", "done");
+    } catch (e) {
+      setStatus("❌", "error");
+      this.showError(
+        "Lookup failed: " + (e && e.message ? e.message : String(e))
+      );
+    }
+  }
+
+  renderRows(items) {
+    this.els.results.innerHTML = "";
+    for (let i = 0; i < items.length; i += 1) {
+      const it = items[i];
+      const tr = document.createElement("tr");
+      tr.innerHTML =
+        "<td>" +
+        it.title +
+        "</td>" +
+        "<td class='price'>" +
+        usd(it.price) +
+        "</td>" +
+        "<td>" +
+        (it.condition || "") +
+        "</td>" +
+        "<td>" +
+        (it.url
+          ? "<a href='" + it.url + "' target='_blank' rel='noreferrer'>Open</a>"
+          : "") +
+        "</td>" +
+        "<td>" +
+        (it.source || "") +
+        "</td>";
+      this.els.results.appendChild(tr);
+    }
+  }
+
+  showError(msg) {
+    this.els.error.textContent = msg;
+    this.els.error.style.display = "block";
+  }
+  clearError() {
+    this.els.error.textContent = "";
+    this.els.error.style.display = "none";
+  }
+}
+
+async function initCameraUI() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    app.els.start.disabled = true;
+    app.els.stop.disabled = true;
+    app.els.switchBtn.disabled = true;
+    app.els.torchBtn.disabled = true;
+    app.els.zoomInBtn.disabled = true;
+    app.els.zoomOutBtn.disabled = true;
+    app.els.rotateBtn.disabled = true;
+    app.showError("Camera API not supported in this browser");
+    return;
+  }
+  try {
+    await app.camera.populateDevices();
+  } catch (e) {
+    app.showError("Failed to enumerate cameras: " + String(e && e.message ? e.message : e));
+  }
+}
+
+function initLookupUI() {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const q = params.get("q") || params.get("query") || "";
+    if (q) {
+      app.els.manual.value = q;
+      if (typeof app.lookupWithStatus === "function") app.lookupWithStatus(q);
+      else document.getElementById("lookupBtn")?.click(); // fallback
+    }
+  } catch (_) {}
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  app = new App(); // Kick it
+  initCameraUI();
+  initLookupUI();
+});

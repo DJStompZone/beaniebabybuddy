@@ -1,0 +1,139 @@
+:root {
+  --bg: #0b0f14;
+  --fg: #e8eef7;
+  --muted: #7f8ea3;
+  --accent: #2dd4bf;
+  --danger: #ef4444;
+  --card: #121821;
+  --ok: #10b981;
+}
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+body {
+  font-family: system-ui, Segoe UI, Roboto, Helvetica, Arial;
+  background: #0b0f14;
+  color: var(--fg);
+  padding: 1rem;
+}
+.app {
+  max-width: 960px;
+  margin: 0 auto;
+  display: grid;
+  gap: 1rem;
+}
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+}
+@media (max-width: 768px) {
+  .grid {
+    grid-template-columns: 1fr;
+  }
+}
+.card {
+  background: var(--card);
+  border: 1px solid #1f2937;
+  border-radius: 16px;
+  padding: 1rem;
+}
+h1 {
+  margin: 0 0 0.5rem 0;
+}
+.row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+input,
+button,
+select {
+  border-radius: 12px;
+  padding: 0.6rem 1rem;
+  font-size: 1rem;
+}
+input {
+  background: #0e1420;
+  color: var(--fg);
+  border: 1px solid #2b364b;
+  flex: 1;
+}
+button {
+  border: 0;
+  background: var(--accent);
+  color: #052f2a;
+  font-weight: 700;
+  cursor: pointer;
+}
+button.secondary {
+  background: #1f2937;
+  color: var(--fg);
+  border: 1px solid #2b364b;
+}
+.muted {
+  color: var(--muted);
+}
+.error {
+  color: var(--danger);
+}
+.ok {
+  color: var(--ok);
+}
+
+.video-wrap {
+  position: relative;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #000;
+  min-height: 200px;
+  aspect-ratio: var(--aspect, 16/9);
+}
+.video-wrap.ok-flash {
+  box-shadow: 0 0 0 3px var(--ok) inset;
+}
+.video-wrap.rot90 {
+  aspect-ratio: var(--aspect-inv, 9/16);
+}
+.video-wrap video,
+.video-wrap canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  transform-origin: center center;
+  display: block;
+}
+.video-wrap.rot90 video,
+.video-wrap.rot90 canvas {
+  transform: rotate(90deg);
+}
+
+.scan-band {
+  position: absolute;
+  left: 10%;
+  right: 10%;
+  top: 30%;
+  bottom: 30%;
+  border: 2px dashed rgba(255, 255, 255, 0.25);
+  border-radius: 12px;
+  pointer-events: none;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+th,
+td {
+  border-bottom: 1px solid #1f2937;
+  padding: 0.4rem;
+  text-align: left;
+}
+.price {
+  font-variant-numeric: tabular-nums;
+}
