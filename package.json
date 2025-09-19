@@ -1,6 +1,6 @@
 {
 	"name": "beaniebabybuddy",
-	"version": "1.0.8",
+	"version": "1.0.9",
 	"private": false,
 	"scripts": {
 		"deploy": "wrangler deploy",
