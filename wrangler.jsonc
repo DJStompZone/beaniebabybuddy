@@ -3,7 +3,9 @@
   "main": "src/worker.js",
   "compatibility_date": "2025-09-12",
   "vars": {
-    "EBAY_APP_ID": "DylanWoo-BeanieBa-PRD-e1171b920-8621adfd"
+    "EBAY_APP_ID": "DylanWoo-BeanieBa-PRD-e1171b920-8621adfd",
+    "EBAY_CLIENT_ID": "DylanWoo-BeanieBa-PRD-e1171b920-8621adfd",
+    "X_EBAY_MARKETPLACE_ID": "EBAY_US"
   },
   "observability": {
     "enabled": true

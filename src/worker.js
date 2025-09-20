@@ -6,24 +6,20 @@
  *   -> { items_current, items_sold, stats: { current, sold, combined }, note }
  *
  * Env:
- *   EBAY_APP_ID                // required for Finding API (current+sold fallback)
- *   EBAY_CLIENT_ID             // optional; if present with secret, we try Browse for "current" when query is digits
- *   EBAY_CLIENT_SECRET         // optional; pairs with EBAY_CLIENT_ID for Browse (client-credentials)
- *   X_EBAY_MARKETPLACE_ID      // optional; defaults to EBAY_US for Browse
+ *   EBAY_CLIENT_ID
+ *   EBAY_CLIENT_SECRET
+ *   X_EBAY_MARKETPLACE_ID      // optional; defaults to EBAY_US
  *
  * Caching:
- *   - Result cache: in-memory Map for 15 minutes (same as your original).
- *   - OAuth token cache: in-memory + Workers Cache API (no KV used). TTL derived from expires_in (~2h).
+ *   - Result cache: in-memory Map for 15 minutes
+ *   - OAuth token cache: in-memory + Workers Cache API. TTL derived from expires_in.
  *
- * Notes:
- *   - SOLD still uses Finding (findCompletedItems) because Browse comps require a separate, gated API.
- *   - CURRENT prefers Browse (if UPC-ish and creds present), else Finding (your original behavior).
  */
 
-const CACHE = new Map(); // response cache by query for 15 min
+const CACHE = new Map();
 const TTL_MS = 15 * 60 * 1000;
 
-// Per-isolate OAuth memo (no KV)
+// Per-isolate OAuth memo
 let TOKEN_MEMO = { access_token: null, expires_at: 0, scope_key: "" };
 const BROWSE_SCOPE = "https://api.ebay.com/oauth/api_scope";
 
@@ -196,7 +192,7 @@ async function searchBrowseCurrentByQ(q, limit, market, token) {
 
   const res = await fetch(url.toString(), { headers: { "authorization": `Bearer ${token}`, "x-ebay-c-marketplace-id": market || "EBAY_US", "accept": "application/json" } });
   if (!res.ok) {
-    // We won't blow up the whole request — just let caller fallback to Finding.
+    // Let caller fallback to Finding.
     const txt = await res.text();
     throw new Error(`Browse q failed ${res.status}: ${txt.slice(0, 200)}`);
   }
@@ -225,7 +221,7 @@ export default {
 
       if (!env.EBAY_APP_ID && !(env.EBAY_CLIENT_ID && env.EBAY_CLIENT_SECRET)) {
         // Preserve shape; signal config issue
-        return json({ items_current: [], items_sold: [], stats: { current: {}, sold: {}, combined: {} }, note: "EBAY_APP_ID or EBAY_CLIENT_ID/EBAY_CLIENT_SECRET not set" }, 500);
+        return json({ items_current: [], items_sold: [], stats: { current: {}, sold: {}, combined: {} }, note: "EBAY_CLIENT_ID/EBAY_CLIENT_SECRET not set" }, 500);
       }
 
       const now = Date.now();
@@ -245,10 +241,10 @@ export default {
           if (cur.note) notes.push(cur.note);
         } catch (e) {
           notes.push("Browse current error: " + (e && e.message ? e.message : String(e)));
-          // Fall through to Finding current as backup if we have APP_ID
-          if (env.EBAY_APP_ID) {
+          // Fall through to Finding current as backup if we have CLIENT_ID
+          if (env.EBAY_CLIENT_ID) {
             try {
-              const curF = await searchFindingCurrent(q, env.EBAY_APP_ID);
+              const curF = await searchFindingCurrent(q, env.EBAY_CLIENT_ID);
               items_current = curF.items || [];
               if (curF.note) notes.push(curF.note);
             } catch (e2) {
@@ -257,9 +253,9 @@ export default {
             }
           }
         }
-      } else if (env.EBAY_APP_ID) {
+      } else if (env.EBAY_CLIENT_ID) {
         try {
-          const cur = await searchFindingCurrent(q, env.EBAY_APP_ID);
+          const cur = await searchFindingCurrent(q, env.EBAY_CLIENT_ID);
           items_current = cur.items || [];
           if (cur.note) notes.push(cur.note);
         } catch (e) {
@@ -269,9 +265,9 @@ export default {
       }
 
       // SOLD always via Finding
-      if (env.EBAY_APP_ID) {
+      if (env.EBAY_CLIENT_ID) {
         try {
-          const sold = await searchFindingSold(q, env.EBAY_APP_ID);
+          const sold = await searchFindingSold(q, env.EBAY_CLIENT_ID);
           items_sold = sold.items || [];
           if (sold.note) notes.push(sold.note);
         } catch (e) {
